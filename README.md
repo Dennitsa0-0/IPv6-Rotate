@@ -90,6 +90,9 @@ sudo systemctl enable --now ipv6-rotate.timer
 
 ```bash
 ipv6-rotate
+ipv6-rotate help
+ipv6-rotate help rotate
+ipv6-rotate rotate --help
 ipv6-rotate --dry-run
 ipv6-rotate rotate
 ipv6-rotate dry-run
@@ -130,6 +133,8 @@ ipv6-rotate uninstall
 ```
 
 `ipv6-rotate` without a subcommand prints help and exits with code `2`. It does not rotate.
+
+Use `ipv6-rotate help` for the full command list, `ipv6-rotate help <command>` for command-specific help, or `ipv6-rotate <command> --help`.
 
 `status --json` is for machine monitoring. `watch --json` is only a live terminal view; do not parse it from monitoring scripts.
 
@@ -304,6 +309,9 @@ sudo systemctl enable --now ipv6-rotate.timer
 
 ```bash
 ipv6-rotate
+ipv6-rotate help
+ipv6-rotate help rotate
+ipv6-rotate rotate --help
 ipv6-rotate --dry-run
 ipv6-rotate rotate
 ipv6-rotate dry-run
@@ -344,6 +352,8 @@ ipv6-rotate uninstall
 ```
 
 `ipv6-rotate` без команды показывает help и выходит с кодом `2`. Ротация не запускается.
+
+Используйте `ipv6-rotate help` для полного списка команд, `ipv6-rotate help <command>` для справки по конкретной команде или `ipv6-rotate <command> --help`.
 
 `status --json` нужен для машинного мониторинга. `watch --json` только для live-view в терминале; не парсите его из мониторинга.
 

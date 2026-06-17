@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+import textwrap
 from pathlib import Path
 
 
@@ -20,9 +21,52 @@ CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/etc/default/ipv6-rotate"))
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/ipv6-rotate"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(STATE_DIR / "state.json")))
 LOCK_FILE = Path(os.environ.get("LOCK_FILE", "/run/ipv6-rotate.lock"))
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 HEALTHCHECK_MODES = {"strict", "external-only", "route-only"}
 LANGUAGES = {"auto", "en", "ru"}
+UI_INDENT = "  "
+COMMAND_GROUPS = [
+    ("Rotation", [
+        ("rotate", "add a new IPv6 and switch default route src"),
+        ("dry-run", "preview rotation without changing the network"),
+        ("rollback", "switch default route src back to a previous IPv6"),
+        ("cleanup", "remove old rotated IPv6 addresses after the grace period"),
+    ]),
+    ("Status and diagnostics", [
+        ("status", "show current status"),
+        ("watch", "refresh status in a live terminal view"),
+        ("doctor", "run operational diagnostics"),
+        ("validate", "validate config and host requirements"),
+        ("test", "run healthcheck for the current route src"),
+        ("self-test", "run internal CLI checks"),
+        ("addresses", "show IPv6 addresses assigned to the interface"),
+        ("history", "show rotation history from state"),
+        ("logs", "show service logs"),
+        ("timer", "show systemd timer status"),
+    ]),
+    ("Configuration", [
+        ("detect", "detect IPv6 configuration"),
+        ("setup", "interactive configuration setup"),
+        ("config", "show effective configuration"),
+        ("edit-config", "open the config file in EDITOR"),
+        ("language", "show or set CLI language"),
+        ("notify-test", "send a test webhook notification"),
+    ]),
+    ("Service", [
+        ("enable", "enable and start the systemd timer"),
+        ("disable", "disable and stop the systemd timer"),
+        ("restart-timer", "restart the systemd timer"),
+        ("menu", "open interactive menu"),
+        ("version", "show version and file paths"),
+        ("purge", "delete config, state, and logs"),
+        ("uninstall", "remove installed files"),
+    ]),
+]
+COMMAND_DESCRIPTIONS = {
+    name: description
+    for _, commands in COMMAND_GROUPS
+    for name, description in commands
+}
 
 
 MESSAGES = {
@@ -335,6 +379,8 @@ def global_address_details(config):
             "cidr": cidr,
             "ip": normalize_ip(cidr),
             "deprecated": "deprecated" in parts,
+            "tentative": "tentative" in parts,
+            "dadfailed": "dadfailed" in parts,
             "dynamic": "dynamic" in parts,
             "temporary": "temporary" in parts or "mngtmpaddr" in parts,
             "valid_lft": field_after(parts, "valid_lft") or "unknown",
@@ -428,6 +474,37 @@ def address_exists(config, value):
     return any(normalize_ip(cidr) == target for cidr in global_addresses(config))
 
 
+def address_detail(config, value):
+    target = normalize_ip(value)
+    for item in global_address_details(config):
+        if normalize_ip(item["ip"]) == target:
+            return item
+    return None
+
+
+def wait_for_address_ready(config, value, timeout=10, interval=0.25):
+    target = normalize_ip(value)
+    deadline = time.monotonic() + timeout
+    last_status = "not present"
+    while time.monotonic() <= deadline:
+        item = address_detail(config, target)
+        if item:
+            flags = []
+            if item.get("tentative"):
+                flags.append("tentative")
+            if item.get("dadfailed"):
+                flags.append("dadfailed")
+            if item.get("deprecated"):
+                flags.append("deprecated")
+            last_status = ", ".join(flags) if flags else "ready"
+            if item.get("dadfailed"):
+                return f"IPv6 address failed duplicate address detection: {target}"
+            if not item.get("tentative"):
+                return ""
+        time.sleep(interval)
+    return f"IPv6 address did not become ready after {timeout}s: {target} ({last_status})"
+
+
 def generate_ip(config):
     host = ":".join(f"{secrets.randbelow(0x10000):x}" for _ in range(4))
     return normalize_ip(f"{config.prefix}:{host}")
@@ -517,35 +594,104 @@ def state_remove_previous(removed):
     save_state(state)
 
 
+def terminal_width(default=80, minimum=48):
+    return max(minimum, shutil.get_terminal_size((default, 20)).columns)
+
+
+def wrap_cell(value, width):
+    width = max(1, int(width))
+    lines = str(value).splitlines() or [""]
+    wrapped = []
+    for line in lines:
+        if not line:
+            wrapped.append("")
+            continue
+        wrapped.extend(textwrap.wrap(
+            line,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=True,
+        ) or [""])
+    return wrapped
+
+
+def fit_widths(natural_widths, min_widths, available):
+    widths = list(min_widths)
+    budget = max(sum(widths), available)
+    extra = budget - sum(widths)
+    needs = [max(0, natural_widths[index] - widths[index]) for index in range(len(widths))]
+    while extra > 0 and any(needs):
+        changed = False
+        for index, need in enumerate(needs):
+            if need <= 0 or extra <= 0:
+                continue
+            widths[index] += 1
+            needs[index] -= 1
+            extra -= 1
+            changed = True
+        if not changed:
+            break
+    return widths
+
+
+def table_line(widths):
+    return UI_INDENT + "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+
+def print_table_row(cells, widths):
+    wrapped = [wrap_cell(cells[index], widths[index]) for index in range(len(widths))]
+    height = max(len(lines) for lines in wrapped)
+    for line_index in range(height):
+        parts = []
+        for index, width in enumerate(widths):
+            value = wrapped[index][line_index] if line_index < len(wrapped[index]) else ""
+            parts.append(value.ljust(width))
+        print(UI_INDENT + "| " + " | ".join(parts) + " |")
+
+
 def table_kv(title, pairs):
-    print(f"{title}\n")
+    print(f"{UI_INDENT}{title}\n")
     pairs = [(str(k), str(v)) for k, v in pairs]
-    left = max([len(k) for k, _ in pairs] + [5])
-    right = max([len(v) for _, v in pairs] + [5])
-    print("+" + "-" * (left + 2) + "+" + "-" * (right + 2) + "+")
+    natural_left = max([len(k) for k, _ in pairs] + [5])
+    natural_right = max([len(v) for _, v in pairs] + [5])
+    available = terminal_width() - len(UI_INDENT) - 7
+    left_min = min(max(natural_left, 8), 24)
+    right_min = 16
+    left, right = fit_widths([natural_left, natural_right], [left_min, right_min], available)
+
+    print(table_line([left, right]))
     for key, value in pairs:
-        print("| " + key.ljust(left) + " | " + value.ljust(right) + " |")
-    print("+" + "-" * (left + 2) + "+" + "-" * (right + 2) + "+")
+        print_table_row([key, value], [left, right])
+    print(table_line([left, right]))
 
 
 def table_rows(title, headers, rows):
-    print(f"{title}\n")
+    print(f"{UI_INDENT}{title}\n")
     headers = [str(item) for item in headers]
     rows = [[str(item) for item in row] for row in rows]
-    widths = [len(item) for item in headers]
+    column_count = len(headers)
+    normalized_rows = []
     for row in rows:
+        normalized = row[:column_count] + [""] * max(0, column_count - len(row))
+        normalized_rows.append(normalized)
+
+    natural = [len(item) for item in headers]
+    for row in normalized_rows:
         for index, item in enumerate(row):
-            widths[index] = max(widths[index], len(item))
+            natural[index] = max(natural[index], len(item))
 
-    def line(left, mid, right):
-        return left + mid.join("-" * (width + 2) for width in widths) + right
+    min_widths = [min(max(len(header), 6), 18) for header in headers]
+    available = terminal_width() - len(UI_INDENT) - (3 * column_count + 1)
+    widths = fit_widths(natural, min_widths, available)
 
-    print(line("+", "+", "+"))
-    print("| " + " | ".join(item.ljust(widths[index]) for index, item in enumerate(headers)) + " |")
-    print(line("+", "+", "+"))
-    for row in rows:
-        print("| " + " | ".join(row[index].ljust(widths[index]) for index in range(len(widths))) + " |")
-    print(line("+", "+", "+"))
+    print(table_line(widths))
+    print_table_row(headers, widths)
+    print(table_line(widths))
+    for row in normalized_rows:
+        print_table_row(row, widths)
+    print(table_line(widths))
 
 
 def config_values(config):
@@ -738,9 +884,34 @@ def cleanup_old_addresses(config):
 def rollback_route(config, old_route):
     if old_route:
         log(config, f"rollback: restoring old default route: {old_route}")
-        run(["ip", "-6", "route", "replace", *old_route.split()])
-    else:
-        log(config, "rollback: no old default route captured")
+        result = run(["ip", "-6", "route", "replace", *old_route.split()])
+        if result.returncode == 0:
+            return True
+        error = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        log(config, f"ERROR: rollback failed to restore old default route: {error}")
+        return False
+    log(config, "rollback: no old default route captured")
+    return False
+
+
+def remove_added_ip(config, new_ip):
+    log(config, f"rollback: removing new IPv6 address {new_ip}/64")
+    result = run(["ip", "-6", "addr", "del", f"{new_ip}/64", "dev", config.iface])
+    if result.returncode == 0:
+        return True
+    error = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+    log(config, f"ERROR: rollback failed to remove new IPv6 address {new_ip}/64: {error}")
+    return False
+
+
+def fail_rotation_after_add(config, new_ip, old_route, old_src, reason):
+    log(config, f"ERROR: {reason}")
+    route_restored = rollback_route(config, old_route)
+    ip_removed = remove_added_ip(config, new_ip)
+    rollback_status = f"route_restored={route_restored}, new_ip_removed={ip_removed}"
+    state_update(old_src, "fail", f"{reason}; rollback attempted ({rollback_status})")
+    notify_fail(config, f"IPv6 rotation failed on {socket.gethostname()}: new_ip={new_ip}; reason={reason}; {rollback_status}")
+    raise SystemExit(1)
 
 
 def acquire_lock():
@@ -771,8 +942,16 @@ def cmd_rotate(args):
 
     new_ip = add_new_ip(config)
 
+    log(config, f"waiting for IPv6 address to become ready: {new_ip}/64")
+    ready_error = wait_for_address_ready(config, new_ip)
+    if ready_error:
+        fail_rotation_after_add(config, new_ip, old_route, old_src, ready_error)
+
     log(config, f"setting default route src {new_ip}")
-    run(["ip", "-6", "route", "replace", "default", "via", config.gateway, "dev", config.iface, "src", new_ip], check=True)
+    route_result = run(["ip", "-6", "route", "replace", "default", "via", config.gateway, "dev", config.iface, "src", new_ip])
+    if route_result.returncode != 0:
+        error = route_result.stderr.strip() or route_result.stdout.strip() or f"exit code {route_result.returncode}"
+        fail_rotation_after_add(config, new_ip, old_route, old_src, f"failed to set default route src {new_ip}: {error}")
 
     time.sleep(2)
     if healthcheck(config, new_ip):
@@ -782,12 +961,7 @@ def cmd_rotate(args):
         log(config, f"IPv6 rotation complete: {new_ip}")
     else:
         reason = f"healthcheck failed for {new_ip}"
-        log(config, f"ERROR: {reason}")
-        rollback_route(config, old_route)
-        run(["ip", "-6", "addr", "del", f"{new_ip}/64", "dev", config.iface])
-        state_update(old_src, "fail", f"{reason}; rollback attempted")
-        notify_fail(config, f"IPv6 rotation failed on {socket.gethostname()}: new_ip={new_ip}; reason={reason}; rollback=done")
-        raise SystemExit(1)
+        fail_rotation_after_add(config, new_ip, old_route, old_src, reason)
     return lock
 
 
@@ -1330,6 +1504,20 @@ def cmd_self_test(args):
     check("reserved gateway", is_reserved_generated_ip(cfg, cfg.gateway), cfg.gateway)
     check("reserved keep", is_reserved_generated_ip(cfg, cfg.keep_addrs), cfg.keep_addrs)
     check("reserved network", is_reserved_generated_ip(cfg, "2001:db8:abcd:1234::"), "prefix::")
+    wrapped_cell = wrap_cell("https://example.invalid/very/long/path", 12)
+    check("table cell wrapping", len(wrapped_cell) > 1 and all(len(line) <= 12 for line in wrapped_cell), f"{len(wrapped_cell)} lines")
+
+    original_global_address_details = globals()["global_address_details"]
+    ready_checks = [
+        [{"ip": "2001:db8:abcd:1234::3", "tentative": True, "dadfailed": False, "deprecated": False}],
+        [{"ip": "2001:db8:abcd:1234::3", "tentative": False, "dadfailed": False, "deprecated": False}],
+    ]
+    try:
+        globals()["global_address_details"] = lambda _config: ready_checks.pop(0) if ready_checks else []
+        ready_error = wait_for_address_ready(cfg, "2001:db8:abcd:1234::3", timeout=1, interval=0)
+    finally:
+        globals()["global_address_details"] = original_global_address_details
+    check("address readiness wait", ready_error == "", "tentative -> ready")
 
     parsed = parse_env_file(CONFIG_FILE)
     check("config parse", isinstance(parsed, dict), f"{len(parsed)} value(s)")
@@ -1348,6 +1536,18 @@ def cmd_self_test(args):
     else:
         table_error = "rendered"
     check("table rendering", table_ok, table_error)
+
+    help_stdout = io.StringIO()
+    with contextlib.redirect_stdout(help_stdout):
+        help_code = main(["help", "doctor"])
+    help_text = help_stdout.getvalue()
+    check("command help", help_code == 0 and "usage: ipv6-rotate doctor [options]" in help_text, "help doctor")
+
+    error_stderr = io.StringIO()
+    with contextlib.redirect_stderr(error_stderr):
+        error_code = main(["not-a-command"])
+    error_text = error_stderr.getvalue()
+    check("invalid command help", error_code == 2 and "Run: ipv6-rotate --help" in error_text, "clean error")
 
     table_rows("Self Test", ["Check", "Status", "Details"], rows)
     raise SystemExit(1 if failed else 0)
@@ -1529,65 +1729,160 @@ def cmd_uninstall(args):
     log(Config(), "uninstalled ipv6-rotate")
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(prog="ipv6-rotate")
-    parser.add_argument("--dry-run", action="store_true", help="preview rotate without changing anything")
-    sub = parser.add_subparsers(dest="command")
+def print_main_help(short=False):
+    print("usage: ipv6-rotate [--dry-run] <command> [options]")
+    print()
+    print("Safe transactional IPv6 source-address rotator for Linux servers with systemd.")
+    if short:
+        print()
+        print("Common commands:")
+        print(f"{UI_INDENT}status         show current status")
+        print(f"{UI_INDENT}rotate         add a new IPv6 and switch default route src")
+        print(f"{UI_INDENT}dry-run        preview rotation without changing the network")
+        print(f"{UI_INDENT}doctor         run operational diagnostics")
+        print()
+        print("Run: ipv6-rotate --help")
+        print("Run: ipv6-rotate help <command>")
+        return
+    print()
+    print("Global options:")
+    print(f"{UI_INDENT}--dry-run        preview rotate without changing anything")
+    print(f"{UI_INDENT}-h, --help       show this help")
+    print()
+    print("Commands:")
+    for group, commands in COMMAND_GROUPS:
+        print(f"{UI_INDENT}{group}:")
+        for name, description in commands:
+            print(f"{UI_INDENT}{UI_INDENT}{name.ljust(14)} {description}")
+        print()
+    print("Help:")
+    print(f"{UI_INDENT}ipv6-rotate help")
+    print(f"{UI_INDENT}ipv6-rotate help <command>")
+    print(f"{UI_INDENT}ipv6-rotate <command> --help")
 
-    sub.add_parser("rotate").set_defaults(func=cmd_rotate)
-    status = sub.add_parser("status")
+
+def first_command(argv):
+    for item in argv:
+        if item == "--dry-run":
+            continue
+        if item.startswith("-"):
+            continue
+        return item
+    return ""
+
+
+def print_unknown_command(command):
+    print(f"Unknown command: {command}", file=sys.stderr)
+    print("Run: ipv6-rotate --help", file=sys.stderr)
+
+
+def print_command_help(parser, command):
+    command_parser = getattr(parser, "command_parsers", {}).get(command)
+    if not command_parser:
+        print_unknown_command(command)
+        return 2
+    command_parser.print_help()
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ipv6-rotate",
+        usage="ipv6-rotate [--dry-run] <command> [options]",
+        add_help=False,
+    )
+    parser.add_argument("--dry-run", action="store_true", help="preview rotate without changing anything")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    command_parsers = {}
+
+    def add_command(name, **kwargs):
+        description = COMMAND_DESCRIPTIONS.get(name, "")
+        command_parser = sub.add_parser(
+            name,
+            help=description,
+            description=description,
+            usage=f"ipv6-rotate {name} [options]",
+            **kwargs,
+        )
+        command_parsers[name] = command_parser
+        return command_parser
+
+    add_command("rotate").set_defaults(func=cmd_rotate)
+    status = add_command("status")
     status.add_argument("--json", action="store_true")
     status.set_defaults(func=cmd_status)
-    sub.add_parser("dry-run").set_defaults(func=cmd_dry_run)
-    sub.add_parser("test").set_defaults(func=cmd_test)
-    detect = sub.add_parser("detect")
+    add_command("dry-run").set_defaults(func=cmd_dry_run)
+    add_command("test").set_defaults(func=cmd_test)
+    detect = add_command("detect")
     detect.add_argument("--json", action="store_true")
     detect.set_defaults(func=cmd_detect)
-    sub.add_parser("setup").set_defaults(func=cmd_setup)
-    language = sub.add_parser("language")
+    add_command("setup").set_defaults(func=cmd_setup)
+    language = add_command("language")
     language.add_argument("language", nargs="?", choices=sorted(LANGUAGES))
     language.set_defaults(func=cmd_language)
-    sub.add_parser("cleanup").set_defaults(func=cmd_cleanup)
-    sub.add_parser("validate").set_defaults(func=cmd_validate)
-    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
-    sub.add_parser("addresses").set_defaults(func=cmd_addresses)
-    sub.add_parser("self-test").set_defaults(func=cmd_self_test)
-    sub.add_parser("history").set_defaults(func=cmd_history)
-    sub.add_parser("timer").set_defaults(func=cmd_timer)
-    sub.add_parser("config").set_defaults(func=cmd_config)
-    sub.add_parser("edit-config").set_defaults(func=cmd_edit_config)
-    sub.add_parser("enable").set_defaults(func=cmd_enable)
-    sub.add_parser("disable").set_defaults(func=cmd_disable)
-    sub.add_parser("restart-timer").set_defaults(func=cmd_restart_timer)
-    rollback = sub.add_parser("rollback")
+    add_command("cleanup").set_defaults(func=cmd_cleanup)
+    add_command("validate").set_defaults(func=cmd_validate)
+    add_command("doctor").set_defaults(func=cmd_doctor)
+    add_command("addresses").set_defaults(func=cmd_addresses)
+    add_command("self-test").set_defaults(func=cmd_self_test)
+    add_command("history").set_defaults(func=cmd_history)
+    add_command("timer").set_defaults(func=cmd_timer)
+    add_command("config").set_defaults(func=cmd_config)
+    add_command("edit-config").set_defaults(func=cmd_edit_config)
+    add_command("enable").set_defaults(func=cmd_enable)
+    add_command("disable").set_defaults(func=cmd_disable)
+    add_command("restart-timer").set_defaults(func=cmd_restart_timer)
+    rollback = add_command("rollback")
     rollback.add_argument("--ip", default="", help="specific IPv6 address to use as default route src")
     rollback.add_argument("--restore-address", action="store_true", help="add rollback target back to IFACE if it is missing")
     rollback.set_defaults(func=cmd_rollback)
-    purge = sub.add_parser("purge")
+    purge = add_command("purge")
     purge.add_argument("-y", "--yes", action="store_true", help="delete config/state/logs without asking")
     purge.set_defaults(func=cmd_purge)
-    sub.add_parser("version").set_defaults(func=cmd_version)
-    watch = sub.add_parser("watch")
+    add_command("version").set_defaults(func=cmd_version)
+    watch = add_command("watch")
     watch.add_argument("--interval", default=5, type=int)
     watch.add_argument("--json", action="store_true")
     watch.set_defaults(func=cmd_watch)
-    sub.add_parser("notify-test").set_defaults(func=cmd_notify_test)
-    logs = sub.add_parser("logs")
+    add_command("notify-test").set_defaults(func=cmd_notify_test)
+    logs = add_command("logs")
     logs.add_argument("-f", "--follow", action="store_true")
     logs.add_argument("-n", "--lines", default=80, type=int)
     logs.set_defaults(func=cmd_logs)
-    sub.add_parser("menu").set_defaults(func=cmd_menu)
-    sub.add_parser("uninstall").set_defaults(func=cmd_uninstall)
+    add_command("menu").set_defaults(func=cmd_menu)
+    add_command("uninstall").set_defaults(func=cmd_uninstall)
+    parser.command_parsers = command_parsers
     return parser
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
+    command = first_command(argv)
+    if not argv:
+        print_main_help(short=True)
+        return 2
+    if command == "help":
+        help_args = [item for item in argv[argv.index("help") + 1:] if not item.startswith("-")]
+        if not help_args:
+            print_main_help()
+            return 0
+        return print_command_help(parser, help_args[0])
+    if command:
+        if command not in COMMAND_DESCRIPTIONS:
+            print_unknown_command(command)
+            return 2
+        if any(item in {"-h", "--help"} for item in argv):
+            return print_command_help(parser, command)
+    elif any(item in {"-h", "--help"} for item in argv):
+        print_main_help()
+        return 0
+
     args = parser.parse_args(argv)
     if args.dry_run:
         return cmd_dry_run(args)
     if not getattr(args, "command", None):
-        parser.print_help()
+        print_main_help(short=True)
         return 2
     return args.func(args)
 
