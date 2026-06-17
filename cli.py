@@ -1496,11 +1496,11 @@ def cmd_self_test(args):
     check("prefix matching", ip_in_prefix("2001:db8:abcd:1234::2", "2001:db8:abcd:1234"), "inside /64")
 
     cfg = Config()
-    cfg.prefix = cfg.prefix or "2001:db8:abcd:1234"
-    generated = generate_ip(cfg)
-    check("generate_ip prefix", ip_in_prefix(generated, cfg.prefix), generated)
+    cfg.prefix = "2001:db8:abcd:1234"
     cfg.gateway = "2001:db8:abcd:1234::1"
     cfg.keep_addrs = "2001:db8:abcd:1234::2"
+    generated = generate_ip(cfg)
+    check("generate_ip prefix", ip_in_prefix(generated, cfg.prefix), generated)
     check("reserved gateway", is_reserved_generated_ip(cfg, cfg.gateway), cfg.gateway)
     check("reserved keep", is_reserved_generated_ip(cfg, cfg.keep_addrs), cfg.keep_addrs)
     check("reserved network", is_reserved_generated_ip(cfg, "2001:db8:abcd:1234::"), "prefix::")
