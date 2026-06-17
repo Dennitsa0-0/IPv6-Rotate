@@ -968,7 +968,7 @@ def cmd_rotate(args):
     else:
         reason = f"healthcheck failed for {new_ip}"
         fail_rotation_after_add(config, new_ip, old_route, old_src, reason)
-    return lock
+    return 0
 
 
 def cmd_dry_run(args):
@@ -1022,7 +1022,7 @@ def cmd_cleanup(args):
     detect_network(config)
     lock = acquire_lock()
     cleanup_old_addresses(config)
-    return lock
+    return 0
 
 
 def cmd_test(args):
