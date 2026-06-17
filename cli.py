@@ -1,0 +1,1596 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import datetime as dt
+import io
+import ipaddress
+import json
+import locale
+import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/etc/default/ipv6-rotate"))
+STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/ipv6-rotate"))
+STATE_FILE = Path(os.environ.get("STATE_FILE", str(STATE_DIR / "state.json")))
+LOCK_FILE = Path(os.environ.get("LOCK_FILE", "/run/ipv6-rotate.lock"))
+VERSION = "0.3.0"
+HEALTHCHECK_MODES = {"strict", "external-only", "route-only"}
+LANGUAGES = {"auto", "en", "ru"}
+
+
+MESSAGES = {
+    "en": {
+        "active": "active",
+        "addresses_title": "IPv6 Addresses",
+        "all_present": "all present",
+        "auto": "auto",
+        "cancel": "Cancel",
+        "cancelled": "Cancelled.",
+        "change_values": "Change values manually",
+        "check": "Check",
+        "choose_option": "Choose an option: ",
+        "config_title": "IPv6 Rotate Config",
+        "continue": "Continue? [y/N] ",
+        "current": "current",
+        "current_route_src": "Current route src",
+        "default_route": "Default route",
+        "details": "Details",
+        "detected_title": "Detected IPv6 configuration",
+        "doctor_title": "Doctor",
+        "enabled": "Enabled",
+        "external_check": "External check",
+        "external_ipv6": "External IPv6",
+        "gateway": "Gateway",
+        "gateway_ping": "Gateway ping",
+        "grace_seconds": "Grace seconds",
+        "health": "Health",
+        "healthcheck": "Healthcheck",
+        "healthcheck_mode": "Healthcheck mode",
+        "interface": "Interface",
+        "keep_address": "Keep address",
+        "keep_addresses": "Keep addresses",
+        "language": "Language",
+        "last_error": "Last error",
+        "last_rotation": "Last rotation",
+        "last_trigger": "Last trigger",
+        "log_file": "Log file",
+        "manual_prompt": "Leave empty to keep current value.",
+        "missing": "missing",
+        "next_rotation": "Next rotation",
+        "no_addresses": "No global IPv6 addresses from {network} on {iface}",
+        "not_set": "not set",
+        "old_kept_addresses": "Old kept addresses",
+        "press_enter": "\nPress Enter to continue... ",
+        "prefix": "Prefix",
+        "public_ipv6": "Public IPv6",
+        "result": "Result",
+        "route_src": "Route src",
+        "run_validation": "Run validation now? [Y/n] ",
+        "save_config": "Yes, save config",
+        "setup_saved": "Saved configuration to {path}",
+        "show_addresses": "Show detected IPv6 addresses",
+        "state_file": "State file",
+        "status": "Status",
+        "status_title": "IPv6 Rotate Status",
+        "timer": "Timer",
+        "timer_active": "Timer active",
+        "timer_title": "IPv6 Rotate Timer",
+        "unknown": "unknown",
+        "unknown_option": "Unknown option: {choice}",
+        "use_config": "Use this configuration?",
+        "validation_title": "Validation",
+        "webhook": "Webhook",
+    },
+    "ru": {
+        "active": "активен",
+        "addresses_title": "IPv6-адреса",
+        "all_present": "все назначены",
+        "auto": "авто",
+        "cancel": "Отмена",
+        "cancelled": "Отменено.",
+        "change_values": "Изменить вручную",
+        "check": "Проверка",
+        "choose_option": "Выберите пункт: ",
+        "config_title": "Конфигурация IPv6 Rotate",
+        "continue": "Продолжить? [y/N] ",
+        "current": "текущий",
+        "current_route_src": "Текущий route src",
+        "default_route": "Default route",
+        "details": "Детали",
+        "detected_title": "Найдена IPv6-конфигурация",
+        "doctor_title": "Диагностика",
+        "enabled": "Включен",
+        "external_check": "Внешняя проверка",
+        "external_ipv6": "Внешний IPv6",
+        "gateway": "Gateway",
+        "gateway_ping": "Ping gateway",
+        "grace_seconds": "Задержка удаления, сек",
+        "health": "Состояние",
+        "healthcheck": "Проверка связи",
+        "healthcheck_mode": "Режим проверки",
+        "interface": "Интерфейс",
+        "keep_address": "Не удалять адрес",
+        "keep_addresses": "Не удалять адреса",
+        "language": "Язык",
+        "last_error": "Последняя ошибка",
+        "last_rotation": "Последняя ротация",
+        "last_trigger": "Последний запуск",
+        "log_file": "Файл лога",
+        "manual_prompt": "Оставьте пустым, чтобы сохранить текущее значение.",
+        "missing": "не задано",
+        "next_rotation": "Следующая ротация",
+        "no_addresses": "На {iface} нет глобальных IPv6-адресов из {network}",
+        "not_set": "не задан",
+        "old_kept_addresses": "Старые сохраненные адреса",
+        "press_enter": "\nНажмите Enter, чтобы продолжить... ",
+        "prefix": "Prefix",
+        "public_ipv6": "Внешний IPv6",
+        "result": "Результат",
+        "route_src": "Route src",
+        "run_validation": "Запустить проверку сейчас? [Y/n] ",
+        "save_config": "Да, сохранить",
+        "setup_saved": "Конфигурация сохранена в {path}",
+        "show_addresses": "Показать найденные IPv6-адреса",
+        "state_file": "Файл состояния",
+        "status": "Статус",
+        "status_title": "Статус IPv6 Rotate",
+        "timer": "Таймер",
+        "timer_active": "Таймер активен",
+        "timer_title": "Таймер IPv6 Rotate",
+        "unknown": "неизвестно",
+        "unknown_option": "Неизвестный пункт: {choice}",
+        "use_config": "Использовать эту конфигурацию?",
+        "validation_title": "Проверка",
+        "webhook": "Webhook",
+    },
+}
+
+
+def parse_env_file(path):
+    values = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        values[key] = value
+    return values
+
+
+def detect_language():
+    language = (locale.getlocale()[0] or os.environ.get("LANG", "") or "").lower()
+    return "ru" if language.startswith("ru") or ".ru" in language else "en"
+
+
+def normalize_language(value):
+    value = (value or "auto").strip().lower()
+    if value not in LANGUAGES:
+        return "auto"
+    return value
+
+
+def resolve_language(value):
+    value = normalize_language(value)
+    return detect_language() if value == "auto" else value
+
+
+def tr(config, key, **kwargs):
+    language = resolve_language(getattr(config, "language", "auto"))
+    template = MESSAGES.get(language, MESSAGES["en"]).get(key, MESSAGES["en"].get(key, key))
+    return template.format(**kwargs) if kwargs else template
+
+
+class Config:
+    def __init__(self):
+        file_values = parse_env_file(CONFIG_FILE)
+        self.file_values = file_values
+        self.iface = os.environ.get("IFACE", file_values.get("IFACE", ""))
+        self.prefix = os.environ.get("PREFIX", file_values.get("PREFIX", ""))
+        self.gateway = os.environ.get("GATEWAY", file_values.get("GATEWAY", ""))
+        self.keep_addrs = os.environ.get("KEEP_ADDRS", file_values.get("KEEP_ADDRS", ""))
+        self.language = normalize_language(os.environ.get("LANGUAGE", file_values.get("LANGUAGE", "auto")))
+        self.grace_seconds = int(os.environ.get("GRACE_SECONDS", file_values.get("GRACE_SECONDS", "1800")))
+        self.healthcheck_ping6 = os.environ.get(
+            "HEALTHCHECK_PING6",
+            file_values.get("HEALTHCHECK_PING6", file_values.get("HEALTHCHECK_HOSTS", "2606:4700:4700::1111 2001:4860:4860::8888")),
+        )
+        self.healthcheck_urls = os.environ.get(
+            "HEALTHCHECK_URLS",
+            file_values.get("HEALTHCHECK_URLS", file_values.get("HEALTHCHECK_URL", "https://ifconfig.me https://api64.ipify.org")),
+        )
+        self.healthcheck_mode = os.environ.get("HEALTHCHECK_MODE", file_values.get("HEALTHCHECK_MODE", "strict"))
+        self.webhook_url = os.environ.get("WEBHOOK_URL", file_values.get("WEBHOOK_URL", file_values.get("NOTIFY_WEBHOOK_URL", "")))
+        self.log_file = Path(os.environ.get("LOG_FILE", file_values.get("LOG_FILE", "/var/log/ipv6-rotate.log")))
+
+    @property
+    def keep_list(self):
+        return [normalize_ip(item) for item in self.keep_addrs.split() if item]
+
+    @property
+    def ping_hosts(self):
+        return [item for item in self.healthcheck_ping6.split() if item]
+
+    @property
+    def urls(self):
+        return [item for item in self.healthcheck_urls.split() if item]
+
+
+def run(args, check=False, input_text=None):
+    try:
+        return subprocess.run(
+            args,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=check,
+        )
+    except FileNotFoundError:
+        if check:
+            raise
+        return subprocess.CompletedProcess(args, 127, "", f"{args[0]} not found")
+
+
+def command_exists(name):
+    return shutil.which(name) is not None
+
+
+def log(config, message):
+    line = f"{dt.datetime.now().astimezone().isoformat(timespec='seconds')} {message}"
+    print(line, file=sys.stderr)
+    if config.log_file:
+        config.log_file.parent.mkdir(parents=True, exist_ok=True)
+        with config.log_file.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
+def need_root():
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise SystemExit("ERROR: run as root")
+
+
+def normalize_ip(value):
+    return ipaddress.ip_address(value.split("/", 1)[0]).compressed
+
+
+def prefix_network(prefix):
+    return ipaddress.ip_network(prefix.rstrip(":") + "::/64", strict=False)
+
+
+def ip_in_prefix(value, prefix):
+    return ipaddress.ip_address(value.split("/", 1)[0]) in prefix_network(prefix)
+
+
+def require_config(config):
+    if not config.prefix:
+        raise SystemExit("PREFIX is not set, example: PREFIX='2001:db8:abcd:1234'")
+    if config.healthcheck_mode not in HEALTHCHECK_MODES:
+        raise SystemExit(f"HEALTHCHECK_MODE must be one of: {', '.join(sorted(HEALTHCHECK_MODES))}")
+    if not config.keep_list:
+        raise SystemExit("KEEP_ADDRS is empty. Run ipv6-rotate setup or set KEEP_ADDRS explicitly.")
+
+
+def default_route():
+    result = run(["ip", "-6", "route", "show", "default"])
+    return result.stdout.splitlines()[0] if result.stdout.strip() else ""
+
+
+def field_after(words, marker):
+    try:
+        return words[words.index(marker) + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+def detect_network(config):
+    route = default_route()
+    words = route.split()
+    if not config.iface:
+        config.iface = field_after(words, "dev")
+    if not config.gateway:
+        config.gateway = field_after(words, "via")
+    if not config.iface:
+        raise SystemExit("IFACE is not set and could not be auto-detected")
+    if not config.gateway:
+        raise SystemExit("GATEWAY is not set and could not be auto-detected")
+
+
+def default_src():
+    result = run(["ip", "-6", "route", "get", "2600:1901:0:b2bd::"])
+    words = result.stdout.split()
+    source = field_after(words, "src")
+    return normalize_ip(source) if source else ""
+
+
+def global_addresses(config):
+    result = run(["ip", "-o", "-6", "addr", "show", "dev", config.iface, "scope", "global"])
+    addresses = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            addresses.append(parts[3])
+    return addresses
+
+
+def global_address_details(config):
+    result = run(["ip", "-o", "-6", "addr", "show", "dev", config.iface, "scope", "global"])
+    details = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        cidr = parts[3]
+        item = {
+            "cidr": cidr,
+            "ip": normalize_ip(cidr),
+            "deprecated": "deprecated" in parts,
+            "dynamic": "dynamic" in parts,
+            "temporary": "temporary" in parts or "mngtmpaddr" in parts,
+            "valid_lft": field_after(parts, "valid_lft") or "unknown",
+            "preferred_lft": field_after(parts, "preferred_lft") or "unknown",
+        }
+        details.append(item)
+    return details
+
+
+def prefix_from_ip(value):
+    ip = ipaddress.ip_address(value.split("/", 1)[0])
+    return ":".join(part.lstrip("0") or "0" for part in ip.exploded.split(":")[:4])
+
+
+def choose_keep_addrs(config, details, route_src):
+    if config.keep_addrs:
+        return [normalize_ip(item) for item in config.keep_addrs.split() if item]
+    if not config.prefix:
+        return []
+
+    candidates = [
+        item for item in details
+        if ip_in_prefix(item["ip"], config.prefix)
+        and not item.get("deprecated")
+        and not item.get("dynamic")
+        and not item.get("temporary")
+    ]
+    if not candidates:
+        candidates = [item for item in details if ip_in_prefix(item["ip"], config.prefix)]
+    if not candidates:
+        return []
+
+    static_two = normalize_ip(f"{config.prefix}::2")
+    for item in candidates:
+        if normalize_ip(item["ip"]) == static_two:
+            return [static_two]
+    if route_src:
+        route_src = normalize_ip(route_src)
+        for item in candidates:
+            if normalize_ip(item["ip"]) == route_src:
+                return [route_src]
+    if len(candidates) == 1:
+        return [normalize_ip(candidates[0]["ip"])]
+    return [normalize_ip(candidates[0]["ip"])]
+
+
+def detect_config(config):
+    route = default_route()
+    words = route.split()
+    if not config.iface:
+        config.iface = field_after(words, "dev")
+    if not config.gateway:
+        config.gateway = field_after(words, "via")
+    if not config.iface:
+        raise SystemExit("IFACE is not set and could not be auto-detected")
+    if not config.gateway:
+        raise SystemExit("GATEWAY is not set and could not be auto-detected")
+
+    details = global_address_details(config)
+    route_src = default_src()
+    if not config.prefix:
+        source = route_src or (details[0]["ip"] if details else "")
+        if source:
+            config.prefix = prefix_from_ip(source)
+    if not config.prefix:
+        raise SystemExit("PREFIX is not set and could not be auto-detected")
+
+    keep = choose_keep_addrs(config, details, route_src)
+    if keep and not config.keep_addrs:
+        config.keep_addrs = " ".join(keep)
+
+    gateway_ok = False
+    if config.iface and config.gateway:
+        gateway_ok = gateway_ping_ok(config)
+
+    public_ip = public_ipv6(config)
+    external_ok = bool(route_src and public_ip == route_src)
+    return {
+        "route": route,
+        "route_src": route_src,
+        "addresses": details,
+        "keep": keep,
+        "gateway_ok": gateway_ok,
+        "public_ipv6": public_ip,
+        "external_ok": external_ok,
+    }
+
+
+def address_exists(config, value):
+    target = normalize_ip(value)
+    return any(normalize_ip(cidr) == target for cidr in global_addresses(config))
+
+
+def generate_ip(config):
+    host = ":".join(f"{secrets.randbelow(0x10000):x}" for _ in range(4))
+    return normalize_ip(f"{config.prefix}:{host}")
+
+
+def is_keep_addr(config, value):
+    return normalize_ip(value) in set(config.keep_list)
+
+
+def is_reserved_generated_ip(config, value):
+    target = normalize_ip(value)
+    reserved = {
+        normalize_ip(f"{config.prefix}::"),
+        normalize_ip(f"{config.prefix}::1"),
+    }
+    if config.gateway:
+        reserved.add(normalize_ip(config.gateway))
+    return target in reserved or is_keep_addr(config, target)
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def previous_items():
+    return load_state().get("previous", [])
+
+
+def state_update(current, status, message, previous_hint="", deprecated_at=None, deprecated=None):
+    state = load_state()
+    now = int(time.time())
+    now_iso = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+    current = normalize_ip(current) if current else ""
+    previous_hint = normalize_ip(previous_hint) if previous_hint else ""
+    deprecated_at = int(deprecated_at or now)
+
+    previous = []
+    seen = set()
+
+    def add_previous(ip, created_at=None, dep_at=None):
+        if not ip:
+            return
+        ip = normalize_ip(ip)
+        if ip == current or ip in seen:
+            return
+        seen.add(ip)
+        previous.append({
+            "ip": ip,
+            "created_at": int(created_at or now),
+            "deprecated_at": int(dep_at or deprecated_at),
+        })
+
+    for ip in deprecated or []:
+        add_previous(ip, now, deprecated_at)
+    add_previous(previous_hint, now, deprecated_at)
+    add_previous(state.get("current", ""), now, deprecated_at)
+    for item in state.get("previous", []):
+        add_previous(item.get("ip", ""), item.get("created_at", now), item.get("deprecated_at", deprecated_at))
+
+    state["current"] = current
+    state["previous"] = previous
+    if status == "success":
+        state["last_success"] = now_iso
+        state["last_error"] = None
+    else:
+        state["last_error"] = {"time": now_iso, "message": message}
+    state["last_rotation"] = {"status": status, "message": message, "created_at": now}
+    save_state(state)
+
+
+def state_remove_previous(removed):
+    removed = normalize_ip(removed)
+    state = load_state()
+    state["previous"] = [item for item in state.get("previous", []) if normalize_ip(item.get("ip", "::")) != removed]
+    save_state(state)
+
+
+def table_kv(title, pairs):
+    print(f"{title}\n")
+    pairs = [(str(k), str(v)) for k, v in pairs]
+    left = max([len(k) for k, _ in pairs] + [5])
+    right = max([len(v) for _, v in pairs] + [5])
+    print("+" + "-" * (left + 2) + "+" + "-" * (right + 2) + "+")
+    for key, value in pairs:
+        print("| " + key.ljust(left) + " | " + value.ljust(right) + " |")
+    print("+" + "-" * (left + 2) + "+" + "-" * (right + 2) + "+")
+
+
+def table_rows(title, headers, rows):
+    print(f"{title}\n")
+    headers = [str(item) for item in headers]
+    rows = [[str(item) for item in row] for row in rows]
+    widths = [len(item) for item in headers]
+    for row in rows:
+        for index, item in enumerate(row):
+            widths[index] = max(widths[index], len(item))
+
+    def line(left, mid, right):
+        return left + mid.join("-" * (width + 2) for width in widths) + right
+
+    print(line("+", "+", "+"))
+    print("| " + " | ".join(item.ljust(widths[index]) for index, item in enumerate(headers)) + " |")
+    print(line("+", "+", "+"))
+    for row in rows:
+        print("| " + " | ".join(row[index].ljust(widths[index]) for index in range(len(widths))) + " |")
+    print(line("+", "+", "+"))
+
+
+def config_values(config):
+    return {
+        "IFACE": config.iface,
+        "PREFIX": config.prefix,
+        "GATEWAY": config.gateway,
+        "KEEP_ADDRS": config.keep_addrs,
+        "LANGUAGE": config.language,
+        "GRACE_SECONDS": str(config.grace_seconds),
+        "HEALTHCHECK_PING6": config.healthcheck_ping6,
+        "HEALTHCHECK_URLS": config.healthcheck_urls,
+        "HEALTHCHECK_MODE": config.healthcheck_mode,
+        "WEBHOOK_URL": config.webhook_url,
+        "LOG_FILE": str(config.log_file),
+    }
+
+
+def write_config_file(config):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f'{key}="{value}"' for key, value in config_values(config).items()]
+    CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def render_detected_config(config, detected):
+    table_kv(tr(config, "detected_title"), [
+        (tr(config, "interface"), config.iface or tr(config, "missing")),
+        (tr(config, "gateway"), config.gateway or tr(config, "missing")),
+        (tr(config, "prefix"), config.prefix or tr(config, "missing")),
+        (tr(config, "keep_address"), config.keep_addrs or tr(config, "missing")),
+        (tr(config, "public_ipv6"), detected.get("public_ipv6") or tr(config, "unknown")),
+        (tr(config, "gateway_ping"), "OK" if detected.get("gateway_ok") else "WARN"),
+        (tr(config, "external_check"), "OK" if detected.get("external_ok") else "WARN"),
+    ])
+
+
+def prompt_value(label, current):
+    value = input(f"{label} [{current}]: ").strip()
+    return value or current
+
+
+def edit_detected_config(config):
+    print(tr(config, "manual_prompt"))
+    config.iface = prompt_value("IFACE", config.iface)
+    config.gateway = prompt_value("GATEWAY", config.gateway)
+    config.prefix = prompt_value("PREFIX", config.prefix)
+    config.keep_addrs = prompt_value("KEEP_ADDRS", config.keep_addrs)
+    config.healthcheck_mode = prompt_value("HEALTHCHECK_MODE", config.healthcheck_mode)
+
+
+def timer_active():
+    return command_exists("systemctl") and run(["systemctl", "is-active", "--quiet", "ipv6-rotate.timer"]).returncode == 0
+
+
+def timer_next():
+    if not command_exists("systemctl"):
+        return "unknown"
+    result = run(["systemctl", "list-timers", "ipv6-rotate.timer", "--no-pager", "--no-legend"])
+    line = result.stdout.splitlines()[0] if result.stdout.strip() else ""
+    if not line:
+        return "unknown"
+    parts = line.split()
+    return " ".join(parts[:2]) if len(parts) >= 2 else line
+
+
+def timer_details():
+    if not command_exists("systemctl"):
+        return {"active": "unknown", "enabled": "unknown", "next": "unknown", "last": "unknown"}
+    active = "yes" if timer_active() else "no"
+    enabled = run(["systemctl", "is-enabled", "ipv6-rotate.timer"]).stdout.strip() or "unknown"
+    result = run(["systemctl", "show", "ipv6-rotate.timer", "--property=NextElapseUSecRealtime,LastTriggerUSec,OnUnitActiveSec", "--value"])
+    values = [line.strip() for line in result.stdout.splitlines()]
+    return {
+        "active": active,
+        "enabled": enabled,
+        "next": values[0] if len(values) > 0 and values[0] else timer_next(),
+        "last": values[1] if len(values) > 1 and values[1] else "unknown",
+        "interval": values[2] if len(values) > 2 and values[2] else "unknown",
+    }
+
+
+def public_ipv6(config):
+    if not command_exists("curl"):
+        return "unavailable"
+    for url in config.urls:
+        result = run(["curl", "-6", "-fsS", "--max-time", "8", url])
+        value = result.stdout.strip()
+        if result.returncode == 0 and value:
+            return value
+    return "unavailable"
+
+
+def ping_result(label, args):
+    result = run(args)
+    if result.returncode == 0:
+        elapsed = "ok"
+        for part in result.stdout.replace("\n", " ").split():
+            if part.startswith("time="):
+                elapsed = part.split("=", 1)[1] + " ms"
+                break
+        return [label, "OK", elapsed]
+    return [label, "WARN", "failed"]
+
+
+def gateway_ping_ok(config):
+    return run(["ping", "-6", "-c", "1", "-W", "3", "-I", config.iface, config.gateway]).returncode == 0
+
+
+def external_check_ok(config, source_ip):
+    for host in config.ping_hosts:
+        log(config, f"healthcheck: ping {host}")
+        if run(["ping", "-6", "-c", "1", "-W", "3", "-I", source_ip, host]).returncode == 0:
+            return True
+    if command_exists("curl"):
+        for url in config.urls:
+            log(config, f"healthcheck: curl {url}")
+            if run(["curl", "-6", "-fsS", "--max-time", "10", "--interface", source_ip, url]).returncode == 0:
+                return True
+    return False
+
+
+def healthcheck(config, source_ip):
+    source = source_ip or config.iface
+    if config.healthcheck_mode == "route-only":
+        log(config, f"healthcheck: route-only for {source}")
+        return bool(source_ip and address_exists(config, source_ip) and default_src() == normalize_ip(source_ip))
+    if config.healthcheck_mode == "external-only":
+        log(config, f"healthcheck: external-only for {source}")
+        return external_check_ok(config, source)
+    log(config, f"healthcheck: strict ping gateway {config.gateway}")
+    return gateway_ping_ok(config) and external_check_ok(config, source)
+
+
+def notify_fail(config, message):
+    if not config.webhook_url or not command_exists("curl"):
+        return
+    payload = json.dumps({"text": message})
+    run(["curl", "-fsS", "--max-time", "10", "-H", "Content-Type: application/json", "-d", payload, config.webhook_url])
+
+
+def add_new_ip(config, attempts=20):
+    last_error = ""
+    for _ in range(attempts):
+        new_ip = generate_ip(config)
+        if is_reserved_generated_ip(config, new_ip):
+            last_error = "generated only reserved IPv6 addresses"
+            log(config, f"reserved IPv6 generated, retrying: {new_ip}")
+            continue
+        log(config, f"target IPv6: {new_ip}")
+        result = run(["ip", "-6", "addr", "add", f"{new_ip}/64", "dev", config.iface])
+        if result.returncode == 0:
+            return new_ip
+        last_error = result.stderr.strip() or "failed to add IPv6 address"
+        log(config, f"add failed, retrying: {last_error}")
+    raise SystemExit(last_error)
+
+
+def deprecate_old_addresses(config, current):
+    deprecated = []
+    for cidr in global_addresses(config):
+        old_addr = normalize_ip(cidr)
+        if not ip_in_prefix(old_addr, config.prefix) or old_addr == current:
+            continue
+        if is_keep_addr(config, old_addr):
+            log(config, f"keep: {old_addr}/64")
+            continue
+        log(config, f"deprecating old IPv6: {old_addr}/64 preferred_lft 0 valid_lft {config.grace_seconds}")
+        run(["ip", "-6", "addr", "change", f"{old_addr}/64", "dev", config.iface, "preferred_lft", "0", "valid_lft", str(config.grace_seconds)])
+        deprecated.append(old_addr)
+    return deprecated
+
+
+def cleanup_old_addresses(config):
+    now = int(time.time())
+    for item in previous_items():
+        ip = item.get("ip", "")
+        if not ip or not ip_in_prefix(ip, config.prefix):
+            continue
+        deprecated_at = int(item.get("deprecated_at") or item.get("created_at") or now)
+        if is_keep_addr(config, ip):
+            log(config, f"keep: {ip}/64")
+        elif now - deprecated_at >= config.grace_seconds:
+            log(config, f"removing old IPv6: {ip}/64")
+            run(["ip", "-6", "addr", "del", f"{ip}/64", "dev", config.iface])
+            state_remove_previous(ip)
+        else:
+            log(config, f"grace: keeping {ip}/64")
+
+
+def rollback_route(config, old_route):
+    if old_route:
+        log(config, f"rollback: restoring old default route: {old_route}")
+        run(["ip", "-6", "route", "replace", *old_route.split()])
+    else:
+        log(config, "rollback: no old default route captured")
+
+
+def acquire_lock():
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fh = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("Another ipv6-rotate process is already running")
+    return fh
+
+
+def cmd_rotate(args):
+    config = Config()
+    need_root()
+    require_config(config)
+    detect_network(config)
+    lock = acquire_lock()
+    old_route = default_route()
+    old_src = default_src()
+    now = int(time.time())
+    log(config, f"old default route: {old_route or 'none'}")
+    log(config, f"old default src: {old_src or 'none'}")
+
+    new_ip = add_new_ip(config)
+
+    log(config, f"setting default route src {new_ip}")
+    run(["ip", "-6", "route", "replace", "default", "via", config.gateway, "dev", config.iface, "src", new_ip], check=True)
+
+    time.sleep(2)
+    if healthcheck(config, new_ip):
+        log(config, f"healthcheck passed for {new_ip}")
+        deprecated = deprecate_old_addresses(config, new_ip)
+        state_update(new_ip, "success", "rotation complete", old_src, now, deprecated)
+        log(config, f"IPv6 rotation complete: {new_ip}")
+    else:
+        reason = f"healthcheck failed for {new_ip}"
+        log(config, f"ERROR: {reason}")
+        rollback_route(config, old_route)
+        run(["ip", "-6", "addr", "del", f"{new_ip}/64", "dev", config.iface])
+        state_update(old_src, "fail", f"{reason}; rollback attempted")
+        notify_fail(config, f"IPv6 rotation failed on {socket.gethostname()}: new_ip={new_ip}; reason={reason}; rollback=done")
+        raise SystemExit(1)
+    return lock
+
+
+def cmd_dry_run(args):
+    config = Config()
+    require_config(config)
+    detect_network(config)
+    route_src = default_src()
+    new_ip = ""
+    for _ in range(20):
+        candidate = generate_ip(config)
+        if not is_reserved_generated_ip(config, candidate):
+            new_ip = candidate
+            break
+    if not new_ip:
+        raise SystemExit("Could not generate a non-reserved IPv6 address")
+    now = int(time.time())
+
+    print("Dry run\n")
+    print("Would add:")
+    print(f"  {new_ip}/64\n")
+    print("Would set default route:")
+    print(f"  default via {config.gateway} dev {config.iface} src {new_ip}\n")
+    print("Would keep:")
+    for keep in config.keep_list:
+        print(f"  {keep}/64")
+    if route_src:
+        print(f"  {route_src}/64")
+
+    print("\nWould deprecate:")
+    deprecated = []
+    for cidr in global_addresses(config):
+        addr = normalize_ip(cidr)
+        if ip_in_prefix(addr, config.prefix) and addr != route_src and not is_keep_addr(config, addr):
+            deprecated.append(f"{addr}/64")
+    print("\n".join(f"  {item}" for item in deprecated) if deprecated else "  none")
+
+    print("\nWould remove after grace period:")
+    removable = []
+    for item in previous_items():
+        ip = item.get("ip", "")
+        deprecated_at = int(item.get("deprecated_at") or item.get("created_at") or now)
+        if ip and now - deprecated_at >= config.grace_seconds:
+            removable.append(f"{ip}/64")
+    print("\n".join(f"  {item}" for item in removable) if removable else "  none")
+
+
+def cmd_cleanup(args):
+    config = Config()
+    need_root()
+    require_config(config)
+    detect_network(config)
+    lock = acquire_lock()
+    cleanup_old_addresses(config)
+    return lock
+
+
+def cmd_test(args):
+    config = Config()
+    require_config(config)
+    detect_network(config)
+    if not healthcheck(config, default_src()):
+        raise SystemExit(1)
+    log(config, "healthcheck passed")
+
+
+def cmd_detect(args):
+    config = Config()
+    detected = detect_config(config)
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "interface": config.iface,
+            "prefix": config.prefix,
+            "gateway": config.gateway,
+            "keep_addrs": config.keep_addrs.split(),
+            "route_src": detected.get("route_src") or "unknown",
+            "public_ipv6": detected.get("public_ipv6") or "unknown",
+            "gateway_ping": bool(detected.get("gateway_ok")),
+            "external_check": bool(detected.get("external_ok")),
+            "addresses": detected.get("addresses", []),
+        }, indent=2))
+        return
+    render_detected_config(config, detected)
+
+
+def cmd_setup(args):
+    config = Config()
+    need_root()
+    while True:
+        detected = detect_config(config)
+        render_detected_config(config, detected)
+        print()
+        print(tr(config, "use_config"))
+        print(f"  1) {tr(config, 'save_config')}")
+        print(f"  2) {tr(config, 'change_values')}")
+        print(f"  3) {tr(config, 'show_addresses')}")
+        print(f"  4) {tr(config, 'cancel')}")
+        choice = input("> ").strip()
+        if choice == "1":
+            write_config_file(config)
+            print(tr(config, "setup_saved", path=CONFIG_FILE))
+            print()
+            if input(tr(config, "run_validation")).strip().lower() not in {"n", "no"}:
+                try:
+                    cmd_validate(argparse.Namespace())
+                except SystemExit as exc:
+                    if exc.code not in (None, 0):
+                        print(f"Validation failed with exit code {exc.code}.")
+            print()
+            print("Next commands:")
+            print("  ipv6-rotate validate")
+            print("  ipv6-rotate dry-run")
+            return
+        if choice == "2":
+            edit_detected_config(config)
+            continue
+        if choice == "3":
+            rows = []
+            for item in detected.get("addresses", []):
+                flags = []
+                if item.get("deprecated"):
+                    flags.append("deprecated")
+                if item.get("dynamic"):
+                    flags.append("dynamic")
+                if item.get("temporary"):
+                    flags.append("temporary")
+                if detected.get("route_src") and normalize_ip(item["ip"]) == normalize_ip(detected["route_src"]):
+                    flags.append("route-src")
+                rows.append([item["ip"], ", ".join(flags) or "static", item.get("preferred_lft", "unknown")])
+            table_rows(tr(config, "addresses_title"), ["IPv6", tr(config, "status"), "preferred_lft"], rows or [["-", "WARN", tr(config, "missing")]])
+            continue
+        if choice == "4":
+            print(tr(config, "cancelled"))
+            return
+        print(tr(config, "unknown_option", choice=choice))
+
+
+def cmd_language(args):
+    config = Config()
+    if not getattr(args, "language", None):
+        table_kv(tr(config, "language"), [
+            ("LANGUAGE", config.language),
+            ("Resolved", resolve_language(config.language)),
+            ("Config file", str(CONFIG_FILE)),
+        ])
+        return
+    language = normalize_language(args.language)
+    if language != args.language:
+        raise SystemExit("LANGUAGE must be one of: auto, en, ru")
+    config.language = language
+    write_config_file(config)
+    print(f"LANGUAGE={language}")
+
+
+def last_rotation_summary(state):
+    last = state.get("last_rotation", {})
+    status = last.get("status", "unknown")
+    created_at = last.get("created_at")
+    if created_at:
+        when = dt.datetime.fromtimestamp(int(created_at)).strftime("%F %T")
+        return f"{status}, {when}"
+    return status
+
+
+def cmd_status(args):
+    config = Config()
+    require_config(config)
+    detect_network(config)
+    state = load_state()
+    route_src = default_src()
+    public_ip = public_ipv6(config)
+    timer = timer_active()
+    health = "ok" if route_src and public_ip == route_src else "warn"
+
+    if args.json:
+        print(json.dumps({
+            "interface": config.iface,
+            "prefix": config.prefix,
+            "gateway": config.gateway,
+            "route_src": route_src or "unknown",
+            "public_ipv6": public_ip,
+            "timer_active": timer,
+            "last_rotation_status": state.get("last_rotation", {}).get("status", "unknown"),
+            "health": health,
+        }, indent=2))
+        return
+
+    table_kv(tr(config, "status_title"), [
+        (tr(config, "interface"), config.iface),
+        (tr(config, "prefix"), str(prefix_network(config.prefix))),
+        (tr(config, "gateway"), config.gateway),
+        (tr(config, "healthcheck_mode"), config.healthcheck_mode),
+        (tr(config, "current_route_src"), route_src or tr(config, "unknown")),
+        (tr(config, "public_ipv6"), public_ip),
+        (tr(config, "keep_addresses"), str(len(config.keep_list))),
+        (tr(config, "old_kept_addresses"), str(len(state.get("previous", [])))),
+        (tr(config, "timer"), tr(config, "active") if timer else "inactive"),
+        (tr(config, "next_rotation"), timer_next()),
+        (tr(config, "last_rotation"), last_rotation_summary(state)),
+    ])
+
+    first_host = config.ping_hosts[0] if config.ping_hosts else ""
+    rows = []
+    if config.healthcheck_mode == "strict":
+        rows.append(ping_result("Gateway ping", ["ping", "-6", "-c", "1", "-W", "3", "-I", config.iface, config.gateway]))
+    else:
+        rows.append(["Gateway ping", "SKIP", config.healthcheck_mode])
+    if first_host and route_src:
+        rows.append(ping_result("Cloudflare IPv6 ping", ["ping", "-6", "-c", "1", "-W", "3", "-I", route_src, first_host]))
+    else:
+        rows.append(["Cloudflare IPv6 ping", "WARN", "no route src"])
+    if public_ip == "unavailable":
+        rows.append(["Public IPv6 curl", "WARN", "unavailable"])
+    elif route_src and public_ip == route_src:
+        rows.append(["Public IPv6 curl", "OK", "matched"])
+    else:
+        rows.append(["Public IPv6 curl", "OK", public_ip])
+    if route_src and public_ip == route_src:
+        rows.append(["Route src match", "OK", "matched"])
+    elif public_ip == "unavailable":
+        rows.append(["Route src match", "WARN", "public IPv6 unavailable"])
+    else:
+        rows.append(["Route src match", "WARN", f"route={route_src or 'unknown'} public={public_ip}"])
+    print()
+    table_rows(tr(config, "healthcheck"), [tr(config, "check"), tr(config, "status"), tr(config, "result")], rows)
+
+
+def cmd_validate(args):
+    config = Config()
+    require_config(config)
+    rows = []
+    failed = False
+    rows.append(["Running as root", "OK" if hasattr(os, "geteuid") and os.geteuid() == 0 else "FAIL", "root" if hasattr(os, "geteuid") and os.geteuid() == 0 else "not root"])
+    failed = failed or rows[-1][1] == "FAIL"
+
+    for dep in ["python3", "ip", "ping"]:
+        path = shutil.which(dep)
+        rows.append([f"{dep} installed", "OK" if path else "FAIL", path or "missing"])
+        failed = failed or not path
+    for dep in ["curl", "systemctl", "journalctl"]:
+        path = shutil.which(dep)
+        rows.append([f"{dep} recommended", "OK" if path else "WARN", path or "missing"])
+    for dep in ["bash", "awk", "sed"]:
+        path = shutil.which(dep)
+        rows.append([f"{dep} installer-only", "OK" if path else "WARN", path or "missing"])
+
+    try:
+        network = prefix_network(config.prefix)
+        rows.append(["Prefix format", "OK", str(network)])
+    except Exception:
+        rows.append(["Prefix format", "FAIL", "invalid PREFIX"])
+        failed = True
+
+    mode_ok = config.healthcheck_mode in HEALTHCHECK_MODES
+    rows.append(["Healthcheck mode", "OK" if mode_ok else "FAIL", config.healthcheck_mode])
+    failed = failed or not mode_ok
+
+    try:
+        detect_network(config)
+        rows.append(["Network detected", "OK", f"{config.iface} via {config.gateway}"])
+    except SystemExit as exc:
+        rows.append(["Network detected", "FAIL", str(exc)])
+        failed = True
+
+    iface_ok = bool(config.iface) and run(["ip", "link", "show", "dev", config.iface]).returncode == 0
+    rows.append(["Interface exists", "OK" if iface_ok else "FAIL", config.iface or "missing"])
+    failed = failed or not iface_ok
+
+    keep_ok = True
+    for keep in config.keep_list:
+        keep_ok = keep_ok and ip_in_prefix(keep, config.prefix)
+    rows.append(["KEEP_ADDRS in prefix", "OK" if keep_ok else "FAIL", f"{len(config.keep_list)} address(es)"])
+    failed = failed or not keep_ok
+
+    if iface_ok:
+        present = {normalize_ip(cidr) for cidr in global_addresses(config)}
+        missing_keep = [keep for keep in config.keep_list if keep not in present]
+        rows.append([
+            "KEEP_ADDRS assigned",
+            "OK" if not missing_keep else "FAIL",
+            "all present" if not missing_keep else ", ".join(missing_keep),
+        ])
+        failed = failed or bool(missing_keep)
+
+    if config.iface and config.gateway and config.healthcheck_mode == "strict":
+        rows.append(["Gateway reachable", "OK" if gateway_ping_ok(config) else "WARN", config.gateway])
+    else:
+        rows.append(["Gateway reachable", "SKIP", config.healthcheck_mode if config.healthcheck_mode != "strict" else "IFACE/GATEWAY missing"])
+
+    timer_found = command_exists("systemctl") and run(["systemctl", "list-unit-files", "ipv6-rotate.timer"]).returncode == 0
+    rows.append(["systemd timer installed", "OK" if timer_found else "WARN", "ipv6-rotate.timer" if timer_found else "not found"])
+    table_rows(tr(config, "validation_title"), [tr(config, "check"), tr(config, "status"), tr(config, "details")], rows)
+    raise SystemExit(1 if failed else 0)
+
+
+def cmd_doctor(args):
+    config = Config()
+    require_config(config)
+    rows = []
+    failed = False
+
+    try:
+        detect_network(config)
+        rows.append(["Config", "OK", f"{config.iface} via {config.gateway}"])
+    except SystemExit as exc:
+        rows.append(["Config", "FAIL", str(exc)])
+        failed = True
+
+    rows.append(["Healthcheck mode", "OK" if config.healthcheck_mode in HEALTHCHECK_MODES else "FAIL", config.healthcheck_mode])
+    failed = failed or config.healthcheck_mode not in HEALTHCHECK_MODES
+
+    for dep in ["ip", "ping", "curl", "systemctl"]:
+        path = shutil.which(dep)
+        status = "OK" if path else ("WARN" if dep in {"curl", "systemctl"} else "FAIL")
+        rows.append([f"Command {dep}", status, path or "missing"])
+        failed = failed or status == "FAIL"
+
+    route = default_route() if command_exists("ip") else ""
+    route_src = default_src() if command_exists("ip") else ""
+    rows.append(["Default route", "OK" if route else "FAIL", route or "missing"])
+    rows.append(["Route src", "OK" if route_src else "WARN", route_src or "unknown"])
+    failed = failed or not route
+
+    if config.iface and command_exists("ip"):
+        addrs = [normalize_ip(cidr) for cidr in global_addresses(config) if ip_in_prefix(normalize_ip(cidr), config.prefix)]
+        rows.append(["Rotated prefix addrs", "OK" if addrs else "WARN", str(len(addrs))])
+
+    if config.iface and config.gateway and config.healthcheck_mode == "strict":
+        rows.append(["Gateway ping", "OK" if gateway_ping_ok(config) else "WARN", config.gateway])
+    elif config.healthcheck_mode != "strict":
+        rows.append(["Gateway ping", "SKIP", config.healthcheck_mode])
+
+    if route_src:
+        external = external_check_ok(config, route_src)
+        rows.append(["External IPv6", "OK" if external else "WARN", "ping/curl via route src"])
+
+    state = load_state()
+    last_error = state.get("last_error")
+    rows.append(["Timer active", "OK" if timer_active() else "WARN", "active" if timer_active() else "inactive"])
+    rows.append(["Next rotation", "INFO", timer_next()])
+    rows.append(["Last rotation", "INFO", last_rotation_summary(state)])
+    rows.append(["Last error", "WARN" if last_error else "OK", json.dumps(last_error) if last_error else "none"])
+    table_rows(tr(config, "doctor_title"), [tr(config, "check"), tr(config, "status"), tr(config, "details")], rows)
+    raise SystemExit(1 if failed else 0)
+
+
+def cmd_timer(args):
+    details = timer_details()
+    config = Config()
+    table_kv(tr(config, "timer_title"), [
+        ("Active", details.get("active", "unknown")),
+        (tr(config, "enabled"), details.get("enabled", "unknown")),
+        (tr(config, "next_rotation"), details.get("next", "unknown")),
+        (tr(config, "last_trigger"), details.get("last", "unknown")),
+        ("Interval", details.get("interval", "unknown")),
+    ])
+
+
+def cmd_config(args):
+    config = Config()
+    table_kv(tr(config, "config_title"), [
+        ("Config file", str(CONFIG_FILE)),
+        (tr(config, "interface"), config.iface or tr(config, "auto")),
+        (tr(config, "prefix"), config.prefix or tr(config, "missing")),
+        (tr(config, "gateway"), config.gateway or tr(config, "auto")),
+        (tr(config, "keep_addresses"), config.keep_addrs or tr(config, "auto")),
+        (tr(config, "language"), config.language),
+        (tr(config, "grace_seconds"), str(config.grace_seconds)),
+        (tr(config, "healthcheck_mode"), config.healthcheck_mode),
+        ("Ping checks", config.healthcheck_ping6),
+        ("URL checks", config.healthcheck_urls),
+        (tr(config, "webhook"), "set" if config.webhook_url else tr(config, "not_set")),
+        (tr(config, "log_file"), str(config.log_file)),
+        (tr(config, "state_file"), str(STATE_FILE)),
+    ])
+
+
+def cmd_edit_config(args):
+    editor = os.environ.get("EDITOR", "nano")
+    subprocess.run([editor, str(CONFIG_FILE)], check=False)
+
+
+def cmd_enable(args):
+    need_root()
+    subprocess.run(["systemctl", "enable", "--now", "ipv6-rotate.timer"], check=False)
+
+
+def cmd_disable(args):
+    need_root()
+    subprocess.run(["systemctl", "disable", "--now", "ipv6-rotate.timer"], check=False)
+
+
+def cmd_restart_timer(args):
+    need_root()
+    subprocess.run(["systemctl", "restart", "ipv6-rotate.timer"], check=False)
+
+
+def rollback_target(args, state):
+    explicit = getattr(args, "ip", "")
+    if explicit:
+        return normalize_ip(explicit)
+    previous = state.get("previous", [])
+    for item in previous:
+        if item.get("ip"):
+            return normalize_ip(item["ip"])
+    return normalize_ip(state.get("current", "")) if state.get("current") else ""
+
+
+def cmd_rollback(args):
+    config = Config()
+    need_root()
+    require_config(config)
+    detect_network(config)
+    state = load_state()
+    target = rollback_target(args, state)
+    if not target:
+        raise SystemExit(f"No previous/current IPv6 in {STATE_FILE}")
+    if not ip_in_prefix(target, config.prefix):
+        raise SystemExit(f"Rollback target is outside PREFIX: {target}")
+    if not address_exists(config, target):
+        if not getattr(args, "restore_address", False):
+            raise SystemExit(f"Rollback target is not assigned to {config.iface}: {target}. Use --restore-address to add it back.")
+        log(config, f"rollback: restoring missing IPv6 address {target}/64 on {config.iface}")
+        result = run(["ip", "-6", "addr", "add", f"{target}/64", "dev", config.iface])
+        if result.returncode != 0:
+            raise SystemExit(result.stderr.strip() or f"failed to restore IPv6 address {target}")
+    old_src = default_src()
+    log(config, f"rollback: setting default route src {target}")
+    run(["ip", "-6", "route", "replace", "default", "via", config.gateway, "dev", config.iface, "src", target], check=True)
+    state_update(target, "success", "rollback complete", old_src)
+
+
+def cmd_purge(args):
+    need_root()
+    if not getattr(args, "yes", False) and not confirm("This will delete ipv6-rotate config, state, and log files."):
+        print("Cancelled.")
+        return
+    config = Config()
+    for path in [CONFIG_FILE, config.log_file]:
+        try:
+            path.unlink()
+            print(f"Removed {path}")
+        except FileNotFoundError:
+            pass
+    shutil.rmtree(STATE_DIR, ignore_errors=True)
+    print(f"Removed {STATE_DIR}")
+
+
+def cmd_version(args):
+    table_kv("IPv6 Rotate Version", [
+        ("Version", VERSION),
+        ("CLI path", str(Path(__file__).resolve())),
+        ("Config file", str(CONFIG_FILE)),
+        ("State file", str(STATE_FILE)),
+    ])
+
+
+def cmd_notify_test(args):
+    config = Config()
+    if not config.webhook_url:
+        raise SystemExit("WEBHOOK_URL is not set")
+    if not command_exists("curl"):
+        raise SystemExit("curl is not installed")
+    payload = json.dumps({"text": f"ipv6-rotate test notification from {socket.gethostname()}"})
+    result = run(["curl", "-fsS", "--max-time", "10", "-H", "Content-Type: application/json", "-d", payload, config.webhook_url])
+    if result.returncode == 0:
+        print("OK: test notification sent")
+        return
+    raise SystemExit(result.stderr.strip() or "FAIL: test notification was not sent")
+
+
+def cmd_watch(args):
+    interval = max(1, int(args.interval))
+    try:
+        while True:
+            os.system("clear" if os.name != "nt" else "cls")
+            try:
+                cmd_status(argparse.Namespace(json=args.json))
+            except SystemExit as exc:
+                print(exc)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return
+
+
+def address_role(config, addr, route_src):
+    if is_keep_addr(config, addr):
+        return "keep"
+    if route_src and normalize_ip(addr) == normalize_ip(route_src):
+        return "current"
+    return "rotated"
+
+
+def address_lifetime(item):
+    if item["deprecated"]:
+        return item["valid_lft"]
+    preferred = item.get("preferred_lft", "unknown")
+    if preferred == "forever":
+        return "forever"
+    return "preferred"
+
+
+def cmd_addresses(args):
+    config = Config()
+    require_config(config)
+    detect_network(config)
+    route_src = default_src()
+    rows = []
+    for item in global_address_details(config):
+        addr = item["ip"]
+        if not ip_in_prefix(addr, config.prefix):
+            continue
+        role = "deprecated" if item["deprecated"] else address_role(config, addr, route_src)
+        rows.append([addr, role, address_lifetime(item)])
+    if not rows:
+        print(tr(config, "no_addresses", network=prefix_network(config.prefix), iface=config.iface))
+        return
+    table_rows(tr(config, "addresses_title"), ["IPv6", "Role", "Lifetime"], rows)
+
+
+def cmd_self_test(args):
+    rows = []
+    failed = False
+
+    def check(name, ok, details):
+        nonlocal failed
+        rows.append([name, "OK" if ok else "FAIL", details])
+        failed = failed or not ok
+
+    sample = "2001:0db8:abcd:1234:0000:0000:0000:0002"
+    check("normalize_ip", normalize_ip(sample) == "2001:db8:abcd:1234::2", normalize_ip(sample))
+    check("prefix matching", ip_in_prefix("2001:db8:abcd:1234::2", "2001:db8:abcd:1234"), "inside /64")
+
+    cfg = Config()
+    cfg.prefix = cfg.prefix or "2001:db8:abcd:1234"
+    generated = generate_ip(cfg)
+    check("generate_ip prefix", ip_in_prefix(generated, cfg.prefix), generated)
+    cfg.gateway = "2001:db8:abcd:1234::1"
+    cfg.keep_addrs = "2001:db8:abcd:1234::2"
+    check("reserved gateway", is_reserved_generated_ip(cfg, cfg.gateway), cfg.gateway)
+    check("reserved keep", is_reserved_generated_ip(cfg, cfg.keep_addrs), cfg.keep_addrs)
+    check("reserved network", is_reserved_generated_ip(cfg, "2001:db8:abcd:1234::"), "prefix::")
+
+    parsed = parse_env_file(CONFIG_FILE)
+    check("config parse", isinstance(parsed, dict), f"{len(parsed)} value(s)")
+
+    state = load_state()
+    check("state read", isinstance(state, dict), f"{len(state)} key(s)")
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            table_kv("Table self-test", [("left", "right")])
+            table_rows("Rows self-test", ["A", "B"], [["1", "2"]])
+        table_ok = True
+    except Exception as exc:
+        table_ok = False
+        table_error = str(exc)
+    else:
+        table_error = "rendered"
+    check("table rendering", table_ok, table_error)
+
+    table_rows("Self Test", ["Check", "Status", "Details"], rows)
+    raise SystemExit(1 if failed else 0)
+
+
+def cmd_history(args):
+    state = load_state()
+    rows = []
+    last = state.get("last_rotation", {})
+    if state.get("current"):
+        created_at = last.get("created_at")
+        when = dt.datetime.fromtimestamp(int(created_at)).strftime("%F %T") if created_at else "unknown"
+        rows.append([when, state["current"], last.get("status", "current")])
+    for item in state.get("previous", []):
+        timestamp = item.get("deprecated_at") or item.get("created_at")
+        when = dt.datetime.fromtimestamp(int(timestamp)).strftime("%F %T") if timestamp else "unknown"
+        rows.append([when, item.get("ip", ""), "deprecated"])
+    if not rows:
+        print(f"No rotation history in {STATE_FILE}")
+        return
+    table_rows("Rotation history", ["Time", "IPv6", "Status"], rows)
+
+
+def cmd_logs(args, replace_process=False):
+    config = Config()
+    if command_exists("journalctl"):
+        if args.follow:
+            cmd = ["journalctl", "-u", "ipv6-rotate.service", "-f"]
+        else:
+            cmd = ["journalctl", "-u", "ipv6-rotate.service", "-n", str(args.lines), "--no-pager"]
+        if replace_process:
+            os.execvp(cmd[0], cmd)
+        subprocess.run(cmd, check=False)
+        return
+    if config.log_file.exists():
+        if args.follow:
+            cmd = ["tail", "-f", str(config.log_file)]
+        else:
+            cmd = ["tail", "-n", str(args.lines), str(config.log_file)]
+        if replace_process:
+            os.execvp(cmd[0], cmd)
+        subprocess.run(cmd, check=False)
+        return
+    raise SystemExit(f"No journalctl and no log file: {config.log_file}")
+
+
+def confirm(message, config=None):
+    config = config or Config()
+    answer = input(f"{message}\n{tr(config, 'continue')}").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def menu_call(func, *args):
+    try:
+        return func(*args)
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            print(exc)
+        return None
+
+
+def cmd_menu(args):
+    config = Config()
+    menu_text = {
+        "en": """IPv6 Rotate Manager
+
+  1) Show status
+  2) Rotate now
+  3) Dry-run rotation
+  4) Validate config
+  5) Run doctor
+  6) Cleanup old IPv6 addresses
+  7) Show history
+  8) Show logs
+  9) Show timer
+ 10) Edit config
+ 11) Restart timer
+ 12) Disable timer
+ 13) Enable timer
+ 14) Rollback to previous IPv6
+ 15) Watch status
+ 16) Send test notification
+ 17) Show IPv6 addresses
+ 18) Run self-test
+ 19) Detect IPv6 config
+ 20) Setup config
+ 21) Language
+  0) Exit
+""",
+        "ru": """IPv6 Rotate Manager
+
+  1) Показать статус
+  2) Запустить ротацию сейчас
+  3) Проверить ротацию без изменений
+  4) Проверить конфиг
+  5) Диагностика
+  6) Очистить старые IPv6-адреса
+  7) История
+  8) Логи
+  9) Таймер
+ 10) Редактировать конфиг
+ 11) Перезапустить таймер
+ 12) Отключить таймер
+ 13) Включить таймер
+ 14) Откатиться на предыдущий IPv6
+ 15) Следить за статусом
+ 16) Тестовое уведомление
+ 17) Показать IPv6-адреса
+ 18) Самопроверка
+ 19) Найти IPv6-конфигурацию
+ 20) Настроить конфиг
+ 21) Язык
+  0) Выход
+""",
+    }
+    while True:
+        print(menu_text[resolve_language(config.language)])
+        choice = input(tr(config, "choose_option")).strip()
+        if choice == "1":
+            menu_call(cmd_status, argparse.Namespace(json=False))
+        elif choice == "2" and confirm("This will add a new IPv6 address and change default IPv6 route src.", config):
+            menu_call(cmd_rotate, argparse.Namespace())
+        elif choice == "3":
+            menu_call(cmd_dry_run, argparse.Namespace())
+        elif choice == "4":
+            menu_call(cmd_validate, argparse.Namespace())
+        elif choice == "5":
+            menu_call(cmd_doctor, argparse.Namespace())
+        elif choice == "6" and confirm("This may remove old rotated IPv6 addresses.\nStatic KEEP_ADDRS will not be removed.", config):
+            menu_call(cmd_cleanup, argparse.Namespace())
+        elif choice == "7":
+            menu_call(cmd_history, argparse.Namespace())
+        elif choice == "8":
+            menu_call(cmd_logs, argparse.Namespace(follow=False, lines=80))
+        elif choice == "9":
+            menu_call(cmd_timer, argparse.Namespace())
+        elif choice == "10":
+            menu_call(cmd_edit_config, argparse.Namespace())
+        elif choice == "11" and confirm("This will restart ipv6-rotate.timer.", config):
+            menu_call(cmd_restart_timer, argparse.Namespace())
+        elif choice == "12" and confirm("This will disable ipv6-rotate.timer.", config):
+            menu_call(cmd_disable, argparse.Namespace())
+        elif choice == "13":
+            menu_call(cmd_enable, argparse.Namespace())
+        elif choice == "14" and confirm("This will change default IPv6 route src to the previous address from state.", config):
+            menu_call(cmd_rollback, argparse.Namespace(ip="", restore_address=False))
+        elif choice == "15":
+            menu_call(cmd_watch, argparse.Namespace(interval=5, json=False))
+        elif choice == "16":
+            menu_call(cmd_notify_test, argparse.Namespace())
+        elif choice == "17":
+            menu_call(cmd_addresses, argparse.Namespace())
+        elif choice == "18":
+            menu_call(cmd_self_test, argparse.Namespace())
+        elif choice == "19":
+            menu_call(cmd_detect, argparse.Namespace(json=False))
+        elif choice == "20":
+            menu_call(cmd_setup, argparse.Namespace())
+        elif choice == "21":
+            menu_call(cmd_language, argparse.Namespace(language=None))
+        elif choice == "0":
+            return
+        elif choice not in {"2", "6", "11", "12", "14"}:
+            print(tr(config, "unknown_option", choice=choice))
+        input(tr(config, "press_enter"))
+        print()
+        config = Config()
+
+
+def cmd_uninstall(args):
+    need_root()
+    subprocess.run(["systemctl", "disable", "--now", "ipv6-rotate.timer"], check=False)
+    for path in ["/etc/systemd/system/ipv6-rotate.timer", "/etc/systemd/system/ipv6-rotate.service", "/usr/local/bin/ipv6-rotate.sh", "/usr/local/bin/ipv6-rotate-cli.py", "/usr/local/bin/ipv6-rotate"]:
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    log(Config(), "uninstalled ipv6-rotate")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="ipv6-rotate")
+    parser.add_argument("--dry-run", action="store_true", help="preview rotate without changing anything")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("rotate").set_defaults(func=cmd_rotate)
+    status = sub.add_parser("status")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+    sub.add_parser("dry-run").set_defaults(func=cmd_dry_run)
+    sub.add_parser("test").set_defaults(func=cmd_test)
+    detect = sub.add_parser("detect")
+    detect.add_argument("--json", action="store_true")
+    detect.set_defaults(func=cmd_detect)
+    sub.add_parser("setup").set_defaults(func=cmd_setup)
+    language = sub.add_parser("language")
+    language.add_argument("language", nargs="?", choices=sorted(LANGUAGES))
+    language.set_defaults(func=cmd_language)
+    sub.add_parser("cleanup").set_defaults(func=cmd_cleanup)
+    sub.add_parser("validate").set_defaults(func=cmd_validate)
+    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    sub.add_parser("addresses").set_defaults(func=cmd_addresses)
+    sub.add_parser("self-test").set_defaults(func=cmd_self_test)
+    sub.add_parser("history").set_defaults(func=cmd_history)
+    sub.add_parser("timer").set_defaults(func=cmd_timer)
+    sub.add_parser("config").set_defaults(func=cmd_config)
+    sub.add_parser("edit-config").set_defaults(func=cmd_edit_config)
+    sub.add_parser("enable").set_defaults(func=cmd_enable)
+    sub.add_parser("disable").set_defaults(func=cmd_disable)
+    sub.add_parser("restart-timer").set_defaults(func=cmd_restart_timer)
+    rollback = sub.add_parser("rollback")
+    rollback.add_argument("--ip", default="", help="specific IPv6 address to use as default route src")
+    rollback.add_argument("--restore-address", action="store_true", help="add rollback target back to IFACE if it is missing")
+    rollback.set_defaults(func=cmd_rollback)
+    purge = sub.add_parser("purge")
+    purge.add_argument("-y", "--yes", action="store_true", help="delete config/state/logs without asking")
+    purge.set_defaults(func=cmd_purge)
+    sub.add_parser("version").set_defaults(func=cmd_version)
+    watch = sub.add_parser("watch")
+    watch.add_argument("--interval", default=5, type=int)
+    watch.add_argument("--json", action="store_true")
+    watch.set_defaults(func=cmd_watch)
+    sub.add_parser("notify-test").set_defaults(func=cmd_notify_test)
+    logs = sub.add_parser("logs")
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("-n", "--lines", default=80, type=int)
+    logs.set_defaults(func=cmd_logs)
+    sub.add_parser("menu").set_defaults(func=cmd_menu)
+    sub.add_parser("uninstall").set_defaults(func=cmd_uninstall)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.dry_run:
+        return cmd_dry_run(args)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

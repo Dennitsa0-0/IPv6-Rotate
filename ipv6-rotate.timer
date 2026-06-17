@@ -1,0 +1,10 @@
+[Unit]
+Description=Run IPv6 rotation periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${INTERVAL}
+Unit=ipv6-rotate.service
+
+[Install]
+WantedBy=timers.target

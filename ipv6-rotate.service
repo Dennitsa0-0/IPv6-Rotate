@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotate outgoing IPv6 address
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+EnvironmentFile=-/etc/default/ipv6-rotate
+ExecStart=/usr/local/bin/ipv6-rotate rotate
