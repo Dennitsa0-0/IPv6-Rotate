@@ -24,7 +24,7 @@ LOCK_FILE = Path(os.environ.get("LOCK_FILE", "/run/ipv6-rotate.lock"))
 VERSION = "0.3.1"
 HEALTHCHECK_MODES = {"strict", "external-only", "route-only"}
 LANGUAGES = {"auto", "en", "ru"}
-UI_INDENT = "  "
+UI_INDENT = "    "
 COMMAND_GROUPS = [
     ("Rotation", [
         ("rotate", "add a new IPv6 and switch default route src"),
@@ -652,7 +652,9 @@ def print_table_row(cells, widths):
 
 
 def table_kv(title, pairs):
-    print(f"{UI_INDENT}{title}\n")
+    print()
+    print(f"{UI_INDENT}{title}")
+    print()
     pairs = [(str(k), str(v)) for k, v in pairs]
     natural_left = max([len(k) for k, _ in pairs] + [5])
     natural_right = max([len(v) for _, v in pairs] + [5])
@@ -665,10 +667,13 @@ def table_kv(title, pairs):
     for key, value in pairs:
         print_table_row([key, value], [left, right])
     print(table_line([left, right]))
+    print()
 
 
 def table_rows(title, headers, rows):
-    print(f"{UI_INDENT}{title}\n")
+    print()
+    print(f"{UI_INDENT}{title}")
+    print()
     headers = [str(item) for item in headers]
     rows = [[str(item) for item in row] for row in rows]
     column_count = len(headers)
@@ -692,6 +697,7 @@ def table_rows(title, headers, rows):
     for row in normalized_rows:
         print_table_row(row, widths)
     print(table_line(widths))
+    print()
 
 
 def config_values(config):
