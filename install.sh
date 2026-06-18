@@ -11,6 +11,50 @@ ENABLE_TIMER=1
 USE_ENV=0
 ENV_LANGUAGE="${LANGUAGE:-}"
 
+early_lang() {
+  case "${LANGUAGE:-auto}" in
+    ru) echo "ru" ;;
+    en) echo "en" ;;
+    auto)
+      case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
+        ru*|RU*|*.ru*|*.RU*) echo "ru" ;;
+        *) echo "en" ;;
+      esac
+      ;;
+    *) echo "en" ;;
+  esac
+}
+
+early_msg() {
+  local key="$1"
+  case "$(early_lang):${key}" in
+    ru:usage) echo "Использование: bash install.sh [--dry-run] [--yes] [--no-enable-timer] [--use-env]" ;;
+    ru:help_dry_run) echo "  --dry-run          показать найденные значения и план без установки" ;;
+    ru:help_yes) echo "  --yes, -y          не спрашивать подтверждение" ;;
+    ru:help_no_enable) echo "  --no-enable-timer  установить файлы, но не включать ipv6-rotate.timer" ;;
+    ru:help_use_env) echo "  --use-env          переустановить из .env, даже если установленный конфиг существует" ;;
+    ru:use_env_missing) echo "ОШИБКА: передан --use-env, но ${ENV_FILE} не существует" ;;
+    ru:unknown_option) echo "ОШИБКА: неизвестная опция: $2" ;;
+    en:usage|*:usage) echo "Usage: bash install.sh [--dry-run] [--yes] [--no-enable-timer] [--use-env]" ;;
+    en:help_dry_run|*:help_dry_run) echo "  --dry-run          show detected values and planned actions without installing" ;;
+    en:help_yes|*:help_yes) echo "  --yes, -y          do not ask for confirmation" ;;
+    en:help_no_enable|*:help_no_enable) echo "  --no-enable-timer  install files but do not enable/start ipv6-rotate.timer" ;;
+    en:help_use_env|*:help_use_env) echo "  --use-env          reinstall from .env even when installed config exists" ;;
+    en:use_env_missing|*:use_env_missing) echo "ERROR: --use-env was passed, but ${ENV_FILE} does not exist" ;;
+    en:unknown_option|*:unknown_option) echo "ERROR: unknown option: $2" ;;
+    *) echo "$key" ;;
+  esac
+}
+
+print_help() {
+  echo "$(early_msg usage)"
+  echo
+  echo "$(early_msg help_dry_run)"
+  echo "$(early_msg help_yes)"
+  echo "$(early_msg help_no_enable)"
+  echo "$(early_msg help_use_env)"
+}
+
 for arg in "$@"; do
   case "$arg" in
     --yes|-y) ASSUME_YES=1 ;;
@@ -18,17 +62,10 @@ for arg in "$@"; do
     --no-enable-timer) ENABLE_TIMER=0 ;;
     --use-env) USE_ENV=1 ;;
     --help|-h)
-      cat <<EOF
-Usage: bash install.sh [--dry-run] [--yes] [--no-enable-timer] [--use-env]
-
-  --dry-run          show detected values and planned actions without installing
-  --yes, -y          do not ask for confirmation
-  --no-enable-timer  install files but do not enable/start ipv6-rotate.timer
-  --use-env          reinstall from .env even when installed config exists
-EOF
+      print_help
       exit 0
       ;;
-    *) echo "ERROR: unknown option: $arg"; exit 2 ;;
+    *) echo "$(early_msg unknown_option "$arg")"; exit 2 ;;
   esac
 done
 
@@ -38,7 +75,7 @@ ENV_OVERRIDES_CONFIG=0
 ENV_IGNORED_FOR_SAFE_UPDATE=0
 
 if [[ "${USE_ENV}" == "1" && ! -f "${ENV_FILE}" ]]; then
-  echo "ERROR: --use-env was passed, but ${ENV_FILE} does not exist"
+  echo "$(early_msg use_env_missing)"
   exit 2
 elif [[ -f "${CONFIG_FILE}" && "${USE_ENV}" != "1" ]]; then
   # shellcheck disable=SC1090
@@ -124,6 +161,7 @@ msg() {
     ru:preserved_config) echo "сохраняется, не перезаписывается" ;;
     ru:command) echo "Команда" ;;
     ru:try) echo "Попробуйте:" ;;
+    ru:use_env_missing) echo "ОШИБКА: передан --use-env, но ${ENV_FILE} не существует" ;;
     en:dry_run|*:dry_run) echo "Dry run only. Would install:" ;;
     en:detected|*:detected) echo "Detected/configured:" ;;
     en:config_source|*:config_source) echo "Config source" ;;
@@ -161,6 +199,7 @@ msg() {
     en:preserved_config|*:preserved_config) echo "preserved, not rewritten" ;;
     en:command|*:command) echo "Command" ;;
     en:try|*:try) echo "Try:" ;;
+    en:use_env_missing|*:use_env_missing) echo "ERROR: --use-env was passed, but ${ENV_FILE} does not exist" ;;
     *) echo "$key" ;;
   esac
 }
