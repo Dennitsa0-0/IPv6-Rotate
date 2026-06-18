@@ -840,12 +840,16 @@ def timer_enabled():
 def timer_next():
     if not command_exists("systemctl"):
         return "unknown"
-    result = run(["systemctl", "list-timers", "ipv6-rotate.timer", "--no-pager", "--no-legend"])
-    line = result.stdout.splitlines()[0] if result.stdout.strip() else ""
-    if not line:
-        return "unknown"
-    parts = line.split()
-    return " ".join(parts[:2]) if len(parts) >= 2 else line
+    result = run(["systemctl", "list-timers", "ipv6-rotate.timer", "--all", "--no-pager", "--no-legend"])
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("n/a"):
+            continue
+        parts = line.split()
+        if len(parts) >= 4:
+            return " ".join(parts[:4])
+        return line
+    return "unknown"
 
 
 def normalize_interval(value):
@@ -863,9 +867,20 @@ def normalize_interval(value):
 def timer_interval():
     if not command_exists("systemctl"):
         return "unknown"
-    result = run(["systemctl", "show", "ipv6-rotate.timer", "--property=OnUnitActiveSec", "--value"])
-    value = result.stdout.strip()
-    return value or "unknown"
+
+    result = run(["systemctl", "show", "ipv6-rotate.timer", "--property=TimersMonotonic", "--value"])
+    for line in result.stdout.splitlines():
+        if "OnUnitActiveUSec=" in line:
+            value = line.split("OnUnitActiveUSec=", 1)[1].split(";", 1)[0].strip()
+            return value or "unknown"
+
+    result = run(["systemctl", "cat", "ipv6-rotate.timer"])
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("OnUnitActiveSec="):
+            return line.split("=", 1)[1].strip() or "unknown"
+
+    return "unknown"
 
 
 def set_timer_interval(interval):
@@ -891,17 +906,18 @@ def systemctl_timer(action):
 
 def timer_details():
     if not command_exists("systemctl"):
-        return {"active": "unknown", "enabled": "unknown", "next": "unknown", "last": "unknown"}
+        return {"active": "unknown", "enabled": "unknown", "next": "unknown", "last": "unknown", "interval": "unknown"}
     active = "yes" if timer_active() else "no"
     enabled = timer_enabled()
-    result = run(["systemctl", "show", "ipv6-rotate.timer", "--property=NextElapseUSecRealtime,LastTriggerUSec,OnUnitActiveSec", "--value"])
-    values = [line.strip() for line in result.stdout.splitlines()]
+    last_result = run(["systemctl", "show", "ipv6-rotate.timer", "--property=LastTriggerUSec", "--value"])
+    last = last_result.stdout.strip() or "unknown"
+
     return {
         "active": active,
         "enabled": enabled,
-        "next": values[0] if len(values) > 0 and values[0] else timer_next(),
-        "last": values[1] if len(values) > 1 and values[1] else "unknown",
-        "interval": values[2] if len(values) > 2 and values[2] else timer_interval(),
+        "next": timer_next(),
+        "last": last,
+        "interval": timer_interval(),
     }
 
 
