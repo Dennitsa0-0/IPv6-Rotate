@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 TimeoutStartSec=60
+Nice=5
 Restart=no
 NoNewPrivileges=true
 PrivateTmp=true

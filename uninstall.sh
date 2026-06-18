@@ -9,6 +9,7 @@ fi
 systemctl disable --now ipv6-rotate.timer 2>/dev/null || true
 rm -f /etc/systemd/system/ipv6-rotate.timer
 rm -f /etc/systemd/system/ipv6-rotate.service
+rm -rf /etc/systemd/system/ipv6-rotate.timer.d
 systemctl daemon-reload 2>/dev/null || true
 rm -f /usr/local/bin/ipv6-rotate
 rm -f /usr/local/bin/ipv6-rotate.sh
