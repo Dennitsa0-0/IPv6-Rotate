@@ -89,9 +89,9 @@ msg() {
   case "$(lang):${key}" in
     ru:dry_run) echo "Пробный запуск. Будет установлено:" ;;
     ru:detected) echo "Найдено/настроено:" ;;
-    ru:config_source) echo "Источник конфигурации (CONFIG_SOURCE)" ;;
+    ru:config_source) echo "Источник конфигурации" ;;
     ru:timer_interval) echo "Интервал таймера" ;;
-    ru:timer_source) echo "Источник таймера (TIMER_SOURCE)" ;;
+    ru:timer_source) echo "Источник таймера" ;;
     ru:timer_override) echo "Override таймера" ;;
     ru:timer_enable) echo "Таймер будет включён" ;;
     ru:yes) echo "да" ;;
@@ -126,9 +126,9 @@ msg() {
     ru:try) echo "Попробуйте:" ;;
     en:dry_run|*:dry_run) echo "Dry run only. Would install:" ;;
     en:detected|*:detected) echo "Detected/configured:" ;;
-    en:config_source|*:config_source) echo "Config source (CONFIG_SOURCE)" ;;
+    en:config_source|*:config_source) echo "Config source" ;;
     en:timer_interval|*:timer_interval) echo "Timer interval" ;;
-    en:timer_source|*:timer_source) echo "Timer source (TIMER_SOURCE)" ;;
+    en:timer_source|*:timer_source) echo "Timer source" ;;
     en:timer_override|*:timer_override) echo "Timer override" ;;
     en:timer_enable|*:timer_enable) echo "Timer enable" ;;
     en:yes|*:yes) echo "yes" ;;
