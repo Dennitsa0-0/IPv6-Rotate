@@ -122,6 +122,8 @@ systemctl enable --now ipv6-rotate.timer
 systemctl list-timers ipv6-rotate.timer --no-pager
 ```
 
+HTTPS clone is used in the install guide because it works for users without a configured GitHub SSH key. If you prefer SSH and have your key configured, you may use the SSH URL manually.
+
 The target directory must be empty. For reinstall/update, use the update section below.
 
 ### 6. Install With Auto-Detect
@@ -661,6 +663,8 @@ ipv6-rotate status
 systemctl enable --now ipv6-rotate.timer
 systemctl list-timers ipv6-rotate.timer --no-pager
 ```
+
+В инструкции используется HTTPS clone, потому что он работает без настроенного GitHub SSH-ключа. Если у вас уже настроен SSH-ключ, можно вручную использовать SSH URL.
 
 Целевая директория должна быть пустой. Для переустановки или обновления используйте соответствующий раздел ниже.
 
